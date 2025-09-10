@@ -1,11 +1,9 @@
 Callibration
-☐ time between 1st space & presentation of 2nd dot
-☐ refine callibration so that I can change the error
-
+✔ refine callibration so that I can change the error @done (9/10/2025, 10:51:45 AM)
+☐ draw adjustmented points in replay
 ☐ start reording has a terminal argument
 
 Eye_laser_game.py
 ☐ jumps to cursor
 ☐ test callibration in game
-☐ better graphics
-☐ 
+✔ better graphics @done (9/10/2025, 10:52:02 AM)

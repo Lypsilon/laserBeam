@@ -1,5 +1,6 @@
 # calibrate.py
-# Full-screen gaze calibration with perspective transform and single-point redo
+# Full-screen gaze calibration with perspective transform,
+# single-point redo, and manual arrow-key adjustment.
 
 import pygame
 import json
@@ -52,8 +53,7 @@ calibration_points = [
 ]
 NUM_POINTS = len(calibration_points)
 
-# Initialize slots for captured points (None if not captured yet)
-captured_points = [None] * NUM_POINTS
+captured_points = [None] * NUM_POINTS  # store gaze/screen pairs
 
 # --------------------------
 # PYGAME SETUP
@@ -68,6 +68,13 @@ WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
 RED   = (255, 0, 0)
 GREEN = (0, 255, 0)
+CYAN  = (0, 255, 255)
+
+# show init screen immediately
+screen.fill(BLACK)
+msg = font.render("Initializing... Please wait", True, WHITE)
+screen.blit(msg, (WIDTH // 2 - 200, HEIGHT // 2))
+pygame.display.flip()
 
 # --------------------------
 # CONNECT TO PUPIL LABS
@@ -80,58 +87,106 @@ if device is None:
 print("Device connected!")
 
 # --------------------------
+# PREP: Warm up & pre-create file
+# --------------------------
+print("Warming up gaze stream...")
+phase = "init"
+warmup_start = time.time()
+warmup_duration = 2.0  # seconds minimum
+warmup_samples = 30
+samples_collected = 0
+
+# pre-create calibration file so first write is fast
+with open(CALIB_FILE, "w") as f:
+    json.dump([], f)
+
+# --------------------------
+# HELPER: Recompute homography
+# --------------------------
+def recompute_homography():
+    global homography
+    pts = [p for p in captured_points if p is not None]
+    if len(pts) >= 4:
+        src = np.array([p["gaze"] for p in pts], dtype=np.float32)
+        dst = np.array([p["adjusted"] for p in pts], dtype=np.float32)
+        homography, _ = cv2.findHomography(src, dst, method=0)
+    else:
+        homography = None
+
+# --------------------------
 # MAIN LOOP
 # --------------------------
-phase = "capture"  # capture -> replay -> done
 current_index = 0
-redo_index = None  # index of point to redo
+redo_index = None
+manual_edit_index = None
 homography = None
 running = True
 
 while running:
     screen.fill(BLACK)
 
-    if phase == "capture":
+    if phase == "init":
+        msg = font.render("Initializing... Please wait", True, WHITE)
+        screen.blit(msg, (WIDTH // 2 - 200, HEIGHT // 2))
+
+        # collect and discard some samples during warm-up
+        gaze = device.receive_gaze_datum()
+        if gaze:
+            samples_collected += 1
+
+        if (time.time() - warmup_start > warmup_duration) or (samples_collected >= warmup_samples):
+            print("Warm-up finished. Starting calibration.")
+            phase = "capture"
+            current_index = 0
+
+    elif phase == "capture":
         idx = redo_index if redo_index is not None else current_index
         cx, cy = calibration_points[idx]
         pygame.draw.circle(screen, RED, (cx, cy), 20)
-        msg = font.render(f"Look at the dot and press SPACE ({idx+1}/{NUM_POINTS})", True, WHITE)
+        msg = font.render(f"Please look at the dot.)", True, WHITE)
         screen.blit(msg, (50, 50))
 
     elif phase == "replay":
-        # Draw all points at once
-        valid_points = [p for p in captured_points if p is not None]
-        if homography is not None and len(valid_points) > 0:
-            gaze_coords = np.array([p["gaze"] for p in valid_points], dtype=np.float32).reshape(-1,1,2)
-            mapped = cv2.perspectiveTransform(gaze_coords, homography).reshape(-1,2)
-            mapped_idx = 0
         for i, screen_pt in enumerate(calibration_points):
             sx, sy = screen_pt
             pygame.draw.circle(screen, RED, (sx, sy), 20)
-            if captured_points[i] is not None:
-                if homography is not None:
-                    gx, gy = mapped[mapped_idx]
-                    mapped_idx += 1
-                else:
-                    gx, gy = captured_points[i]["screen"]
+
+            if captured_points[i] is not None and homography is not None:
+                gaze_pt = np.array([[[*captured_points[i]["gaze"]]]], dtype=np.float32)
+                mapped_pt = cv2.perspectiveTransform(gaze_pt, homography)[0][0]
+                gx, gy = mapped_pt
                 pygame.draw.circle(screen, GREEN, (int(gx), int(gy)), 15)
-            num_text = font.render(str(i+1), True, WHITE)
-            screen.blit(num_text, (sx-10, sy-10))
-        msg = font.render("Press 1-5 to redo any point, ESC to finish.", True, WHITE)
-        screen.blit(msg, (50, 50))
+
+        # only log instructions in terminal
+        print("Replay mode: 1-5=redo, SHIFT+1-5=manual edit, ESC=finish")
+
+    elif phase == "manual_edit":
+        idx = manual_edit_index
+        sx, sy = calibration_points[idx]
+        gx, gy = captured_points[idx]["adjusted"]
+
+        pygame.draw.circle(screen, RED, (sx, sy), 20)
+        pygame.draw.circle(screen, GREEN, (sx, sy), 15, 2)
+        pygame.draw.circle(screen, CYAN, (int(gx), int(gy)), 10)
 
     elif phase == "done":
-        msg = font.render("Calibration complete! Press ESC to exit.", True, WHITE)
+        msg = font.render("Calibration complete!", True, WHITE)
         screen.blit(msg, (50, 50))
+        print("Calibration complete! Press ESC to exit.")
 
     pygame.display.flip()
 
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
+
         elif event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
-                running = False
+                if phase == "manual_edit":
+                    manual_edit_index = None
+                    phase = "replay"
+                else:
+                    running = False
 
             elif phase == "capture" and event.key == pygame.K_SPACE:
                 idx = redo_index if redo_index is not None else current_index
@@ -142,35 +197,83 @@ while running:
                         gx, gy = undistort_point(gaze.x, gaze.y)
                         samples.append([gx, gy])
                     time.sleep(SAMPLE_INTERVAL)
-                if len(samples) > 0:
+
+                print(f"Collected {len(samples)} samples at point {idx+1}")
+
+                if len(samples) >= int(SAMPLES_PER_POINT * 0.7):  # require ~70%
                     avg = np.mean(np.array(samples), axis=0)
                     cx, cy = calibration_points[idx]
-                    captured_points[idx] = {"gaze": [float(avg[0]), float(avg[1])], "screen": [cx, cy]}
+                    gaze = [float(avg[0]), float(avg[1])]
+
+                    if homography is not None:
+                        gaze_pt = np.array([[[gaze[0], gaze[1]]]], dtype=np.float32)
+                        mapped_pt = cv2.perspectiveTransform(gaze_pt, homography)[0][0]
+                        adjusted = [float(mapped_pt[0]), float(mapped_pt[1])]
+                    else:
+                        adjusted = [cx, cy]
+
+                    captured_points[idx] = {
+                        "gaze": gaze,
+                        "screen": [cx, cy],
+                        "adjusted": adjusted
+                    }
+
                     print(f"Captured point {idx+1}: gaze={avg} -> screen=({cx},{cy})")
+
                     if redo_index is None:
                         current_index += 1
                         if current_index >= NUM_POINTS:
-                            # Compute homography using all captured points
-                            src = np.array([p["gaze"] for p in captured_points if p is not None], dtype=np.float32)
-                            dst = np.array([p["screen"] for p in captured_points if p is not None], dtype=np.float32)
-                            homography, _ = cv2.findHomography(src, dst, method=0)
+                            recompute_homography()
                             phase = "replay"
                     else:
-                        # finished redo, return to replay
                         redo_index = None
-                        # recompute homography with updated point
-                        src = np.array([p["gaze"] for p in captured_points if p is not None], dtype=np.float32)
-                        dst = np.array([p["screen"] for p in captured_points if p is not None], dtype=np.float32)
-                        homography, _ = cv2.findHomography(src, dst, method=0)
+                        recompute_homography()
                         phase = "replay"
+                else:
+                    print("Not enough valid samples, try again.")
 
             elif phase == "replay":
                 if pygame.K_1 <= event.key <= pygame.K_5:
-                    redo_index = event.key - pygame.K_1
-                    if redo_index < NUM_POINTS:
-                        print(f"Redoing point {redo_index+1}")
-                        captured_points[redo_index] = None
-                        phase = "capture"
+                    idx = event.key - pygame.K_1
+                    if idx < NUM_POINTS and captured_points[idx] is not None:
+                        if pygame.key.get_mods() & pygame.KMOD_SHIFT:
+                            manual_edit_index = idx
+                            if homography is not None:
+                                gaze_pt = np.array([[[*captured_points[idx]["gaze"]]]], dtype=np.float32)
+                                mapped_pt = cv2.perspectiveTransform(gaze_pt, homography)[0][0]
+                                captured_points[idx]["adjusted"] = [float(mapped_pt[0]), float(mapped_pt[1])]
+                            else:
+                                captured_points[idx]["adjusted"] = captured_points[idx]["screen"][:]
+                            print(f"Manual edit mode for point {manual_edit_index+1}")
+                            phase = "manual_edit"
+                        else:
+                            redo_index = idx
+                            captured_points[idx] = None
+                            print(f"Redoing point {redo_index+1}")
+                            phase = "capture"
+
+            elif phase == "manual_edit" and manual_edit_index is not None:
+                gx, gy = captured_points[manual_edit_index]["adjusted"]
+                step = 5
+                if pygame.key.get_mods() & pygame.KMOD_SHIFT:
+                    step = 20
+                if event.key == pygame.K_UP:
+                    gy -= step
+                elif event.key == pygame.K_DOWN:
+                    gy += step
+                elif event.key == pygame.K_LEFT:
+                    gx -= step
+                elif event.key == pygame.K_RIGHT:
+                    gx += step
+                elif event.key == pygame.K_RETURN:
+                    print(f"Manual edit confirmed for point {manual_edit_index+1}")
+                    captured_points[manual_edit_index]["adjusted"] = [gx, gy]
+                    recompute_homography()
+                    manual_edit_index = None
+                    phase = "replay"
+                    continue
+
+                captured_points[manual_edit_index]["adjusted"] = [gx, gy]
 
     clock.tick(60)
 
