@@ -1,9 +1,14 @@
 Callibration
 ✔ refine callibration so that I can change the error @done (9/10/2025, 10:51:45 AM)
 ☐ draw adjustmented points in replay
+☐ always pirnting: Replay mode: 1-5=redo, SHIFT+1-5=manual edit, ESC=finish
 ☐ start reording has a terminal argument
 
 Eye_laser_game.py
-☐ jumps to cursor
+☐ eyetracking
+☐ open in 2nd display
+☐ --no_eyetracking should not have calibration
+✔ jumps to cursor @done (9/11/2025, 5:16:07 PM)
 ☐ test callibration in game
+☐ check mapping (not use adjusted)
 ✔ better graphics @done (9/10/2025, 10:52:02 AM)

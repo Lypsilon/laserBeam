@@ -1,5 +1,6 @@
 # Save this file as eye_laser_game.py
-# Run from command line:  python eye_laser_game.py [--timer seconds] [--no-eyetracking]
+# Run from command line:
+#   python eye_laser_game.py [--timer seconds] [--no-eyetracking] [--no_calibration]
 
 import pygame
 import random
@@ -8,6 +9,10 @@ import math
 import sys
 import os
 import csv
+import json
+import numpy as np
+import cv2
+import subprocess
 
 # Pupil Labs
 try:
@@ -17,17 +22,16 @@ except ImportError:
 
 # --- Settings ---
 ASTEROID_SIZE = 100                # asteroid image size
-FIXATION_HALO_MAX_RADIUS = 20     # max radius of the fixation halo
-FIXATION_TIME = 1.0               # seconds of gaze to destroy
-LASER_FIXATION_THRESHOLD = 0.02   # seconds (20ms)
-MIN_DISTANCE = ASTEROID_SIZE * 2  # minimum distance between asteroids
+FIXATION_HALO_MAX_RADIUS = 20      # max radius of the fixation halo
+FIXATION_TIME = 1.0                 # seconds of gaze to destroy
+LASER_FIXATION_THRESHOLD = 0.02    # seconds (20ms)
+MIN_DISTANCE = ASTEROID_SIZE * 2   # minimum distance between asteroids
 MIN_ASTEROIDS = 1
 MAX_ASTEROIDS = 5
 MAX_ON_SCREEN = 8
 SPAWN_PROBABILITY = 0.5
 ASTEROID_RANDOM_DISAPPEAR_CHANCE = 0.001
 only_bad_start_time = None
-
 
 # Hard-coded images in visuals folder
 BACKGROUND_IMAGE_FILE = os.path.join("visuals", "background.png")
@@ -36,6 +40,7 @@ ASTEROID_IMAGE_FILE = os.path.join("visuals", "asteroid.png")
 # Command-line arguments
 GAME_DURATION = None
 NO_EYETRACKING = "--no-eyetracking" in sys.argv
+NO_CALIBRATION = "--no_calibration" in sys.argv
 
 if len(sys.argv) > 2 and sys.argv[1] == '--timer':
     try:
@@ -43,8 +48,32 @@ if len(sys.argv) > 2 and sys.argv[1] == '--timer':
     except ValueError:
         GAME_DURATION = None
 
+# --- Calibration integration ---
+CALIB_FILE = "calibration.json"
+homography = None
+
+def load_homography():
+    global homography
+    try:
+        with open(CALIB_FILE, "r") as f:
+            data = json.load(f)
+        src = np.array([p["gaze"] for p in data], dtype=np.float32)
+        dst = np.array([p["adjusted"] for p in data], dtype=np.float32)
+        homography, _ = cv2.findHomography(src, dst, method=0)
+        print("Loaded homography from calibration.json")
+    except Exception as e:
+        print("Failed to load calibration:", e)
+        homography = None
+
+if not NO_CALIBRATION:
+    print("Running calibration first...")
+    subprocess.run([sys.executable, "calibrate.py"])
+    load_homography()
+else:
+    load_homography()
+
+# --- Pygame setup ---
 pygame.init()
-# Fullscreen mode
 screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
 WIDTH, HEIGHT = screen.get_size()
 pygame.display.set_caption("Eye Laser Game")
@@ -90,7 +119,8 @@ class Asteroid:
             self.rect = pygame.Rect(self.x, self.y, ASTEROID_SIZE, ASTEROID_SIZE)
             valid = True
             for other in existing_asteroids:
-                if math.hypot(self.rect.centerx - other.rect.centerx, self.rect.centery - other.rect.centery) < MIN_DISTANCE:
+                if math.hypot(self.rect.centerx - other.rect.centerx,
+                              self.rect.centery - other.rect.centery) < MIN_DISTANCE:
                     valid = False
                     break
         self.fixating = False
@@ -104,11 +134,15 @@ class Asteroid:
         screen.blit(asteroid_img, self.rect.topleft)
         if self.fixating and self.start_fix is not None:
             elapsed = time.time() - self.start_fix
-            growth = min(FIXATION_HALO_MAX_RADIUS, int((elapsed / FIXATION_TIME) * FIXATION_HALO_MAX_RADIUS))
+            growth = min(FIXATION_HALO_MAX_RADIUS,
+                         int((elapsed / FIXATION_TIME) * FIXATION_HALO_MAX_RADIUS))
             color = (0, 255, 0) if self.type == 'good' else (255, 0, 0)
-            halo_surface = pygame.Surface((FIXATION_HALO_MAX_RADIUS*2, FIXATION_HALO_MAX_RADIUS*2), pygame.SRCALPHA)
-            pygame.draw.circle(halo_surface, (*color, 100), (FIXATION_HALO_MAX_RADIUS, FIXATION_HALO_MAX_RADIUS), growth)
-            screen.blit(halo_surface, (self.rect.centerx - FIXATION_HALO_MAX_RADIUS, self.rect.centery - FIXATION_HALO_MAX_RADIUS))
+            halo_surface = pygame.Surface(
+                (FIXATION_HALO_MAX_RADIUS*2, FIXATION_HALO_MAX_RADIUS*2), pygame.SRCALPHA)
+            pygame.draw.circle(halo_surface, (*color, 100),
+                               (FIXATION_HALO_MAX_RADIUS, FIXATION_HALO_MAX_RADIUS), growth)
+            screen.blit(halo_surface, (self.rect.centerx - FIXATION_HALO_MAX_RADIUS,
+                                       self.rect.centery - FIXATION_HALO_MAX_RADIUS))
 
     def update(self, cursor_pos):
         if self.rect.collidepoint(cursor_pos):
@@ -152,9 +186,15 @@ while running:
     if pl_device:
         gaze = pl_device.receive_gaze_datum()
         if gaze and gaze.norm_pos:
-            gx = int(gaze.norm_pos[0] * WIDTH)
-            gy = int((1 - gaze.norm_pos[1]) * HEIGHT)
-            cursor_pos = (gx, gy)
+            gx = gaze.norm_pos[0] * WIDTH
+            gy = (1 - gaze.norm_pos[1]) * HEIGHT
+
+            if homography is not None:
+                pt = np.array([[[gx, gy]]], dtype=np.float32)
+                mapped = cv2.perspectiveTransform(pt, homography)[0][0]
+                gx, gy = mapped
+
+            cursor_pos = (int(gx), int(gy))
         else:
             cursor_pos = pygame.mouse.get_pos()
     else:
@@ -202,14 +242,12 @@ while running:
         if all(a.type == 'bad' for a in asteroids):
             if only_bad_start_time is None:
                 only_bad_start_time = time.time()
-            elif time.time() - only_bad_start_time > 3:  
-                # Force a good asteroid
+            elif time.time() - only_bad_start_time > 3:
                 spawn_asteroids(asteroids, 1)
                 asteroids[-1].type = 'good'
                 only_bad_start_time = None
         else:
             only_bad_start_time = None
-
 
     # Explosions
     for explosion in explosions[:]:
@@ -225,11 +263,13 @@ while running:
         laser_start_fix = time.time()
     elif time.time() - laser_start_fix >= LASER_FIXATION_THRESHOLD:
         laser_surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        #color of laser beam and halo
-        pygame.draw.line(laser_surface, (186, 85, 211, 80), LASER_ORIGIN, cursor_pos, 15)
-        pygame.draw.line(laser_surface, (148, 0, 211, 150), LASER_ORIGIN, cursor_pos, 8)
+        pygame.draw.line(laser_surface, (186, 85, 211, 80),
+                         LASER_ORIGIN, cursor_pos, 15)
+        pygame.draw.line(laser_surface, (148, 0, 211, 150),
+                         LASER_ORIGIN, cursor_pos, 8)
         screen.blit(laser_surface, (0, 0))
-        pygame.draw.line(screen, (255, 200, 255, 220), LASER_ORIGIN, cursor_pos, 2)
+        pygame.draw.line(screen, (255, 200, 255, 220),
+                         LASER_ORIGIN, cursor_pos, 2)
 
     # Cursor halo
     cursor_surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
@@ -244,7 +284,8 @@ while running:
     if GAME_DURATION is not None:
         elapsed_time = int(time.time() - start_time)
         remaining_time = max(0, GAME_DURATION - elapsed_time)
-        screen.blit(font.render(f"Time: {remaining_time}s", True, (255, 255, 255)), (WIDTH - 150, 10))
+        screen.blit(font.render(f"Time: {remaining_time}s",
+                                True, (255, 255, 255)), (WIDTH - 150, 10))
         if remaining_time <= 0:
             running = False
             end_reason = "timer_finished"
